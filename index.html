@@ -299,11 +299,13 @@ function isBye(text){
 // ── 2. 머리: 중계 서버를 거쳐 AI에게 (흘려받기) ─────────
 // ★ AI가 대답을 다 쓸 때까지 기다리지 않고, 쓰는 대로 조금씩 받는다.
 let aborter = null;
+let diag = {};   // ★ 시간 재기(진단용): 응답 시작·첫 조각·첫 글자·조각 수
 
 async function callAIStream(messages, onText){
   aborter = new AbortController();
   const r = await fetch(WORKER_URL, {method:"POST", headers:{"Content-Type":"application/json"}, signal: aborter.signal,
     body: JSON.stringify({code: CODE, system: buildSystem(), messages, tools: TOOLS, stream: true})});
+  if(!diag.head) diag.head = Date.now();
   if(!r.ok){
     const j = await r.json().catch(() => ({}));
     const why = typeof j.error === "string" ? j.error : (j.error && j.error.message) || "";
@@ -316,6 +318,8 @@ async function callAIStream(messages, onText){
   while(true){
     const {value, done} = await reader.read();
     if(done) break;
+    diag.chunks = (diag.chunks || 0) + 1;
+    if(!diag.chunk1) diag.chunk1 = Date.now();
     buf += dec.decode(value, {stream:true});
     let cut;
     while((cut = buf.indexOf("\n\n")) >= 0){
@@ -330,7 +334,7 @@ async function callAIStream(messages, onText){
         blocks[d.index] = b;
       } else if(d.type === "content_block_delta"){
         const b = blocks[d.index]; if(!b) continue;
-        if(d.delta.type === "text_delta"){ b.text += d.delta.text; onText(d.delta.text); }
+        if(d.delta.type === "text_delta"){ if(!diag.text1) diag.text1 = Date.now(); b.text += d.delta.text; onText(d.delta.text); }
         if(d.delta.type === "input_json_delta"){ b._json += d.delta.partial_json; }
       } else if(d.type === "content_block_stop"){
         const b = blocks[d.index];
@@ -361,12 +365,17 @@ async function think(text){
   const aiDiv = addMsg("ai", "");            // 대답이 쓰이는 대로 채울 자리
   const aiText = aiDiv.querySelector(".body");
   let answer = "";
-  speechBegin(() => {                        // 첫 소리가 날 때 걸린 시간을 적음
-    const t = document.createElement("div");
-    t.className = "time";
-    t.textContent = `기다림 ${waited.toFixed(1)}초 · 첫 대답까지 ${((Date.now() - sentAt) / 1000).toFixed(1)}초`;
-    aiDiv.appendChild(t);
-  });
+  diag = {};
+  const timeEl = document.createElement("div");
+  timeEl.className = "time";
+  aiDiv.appendChild(timeEl);
+  const sec = v => v ? ((v - sentAt) / 1000).toFixed(1) + "초" : "-";
+  const showDiag = () => {                  // ★ 어디서 시간이 드는지 나누어 보여 줌
+    timeEl.textContent = `기다림 ${waited.toFixed(1)}초 · 첫 대답까지 ${sec(diag.sound1)}`
+      + ` [응답 시작 ${sec(diag.head)} · 첫 조각 ${sec(diag.chunk1)} · 첫 글자 ${sec(diag.text1)}`
+      + ` · 다 받음 ${sec(diag.end)} · 조각 ${diag.chunks || 0}개]`;
+  };
+  speechBegin(() => { diag.sound1 = Date.now(); showDiag(); });
 
   try{
     for(let i = 0; i < 5; i++){
@@ -386,6 +395,7 @@ async function think(text){
       msgs = msgs.concat([{role:"user", content: results}]);
       if(answer && !/\s$/.test(answer)){ answer += " "; speechFeed(" "); }
     }
+    diag.end = Date.now(); showDiag();
     if(myTurn !== turnId) return;           // 그사이 끼어들었으면 여기서 멈춤
     if(!answer.trim()){ answer = "죄송합니다. 다시 한번 말씀해 주세요."; aiText.textContent = answer; speechFeed(answer); }
     history.push({role:"assistant", content:answer.trim()});
