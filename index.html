@@ -17,6 +17,7 @@ h1{font-size:26px;margin:0 0 4px}
 .msg.me{background:var(--me);border:1px solid #cdd6e2}
 .msg.ai{background:var(--ai)}
 .who{font-size:16px;color:var(--soft);display:block}
+.time{font-size:14px;color:var(--soft);margin-top:4px}
 #dock{position:fixed;left:0;right:0;bottom:0;background:var(--bg);border-top:1px solid #cdd6e2;
       padding:14px 18px 20px;text-align:center}
 #btn{width:150px;height:150px;border-radius:50%;border:0;color:#fff;font:inherit;font-size:24px;
@@ -92,7 +93,7 @@ const WORKER_URL = "https://malbeot.jeonseungdae84.workers.dev";
 // ═════════════════════════════════════════════
 
 const WAIT_SEC   = 5;
-const SHORT_WAIT = 2;
+const SHORT_WAIT = 1.2;   // 말끝이 마치는 말이면 이만큼만 기다림 (초)
 const END_SOUNDS = /(아니야|다|어|지|까|니|냐|노|나|예|라|네)$/;
 const FIRST_WAIT = 15;
 const GAP_MS     = 500;
@@ -206,10 +207,11 @@ function setState(s, msg){
 function addMsg(who, text){
   const d = document.createElement("div");
   d.className = "msg " + who;
-  d.innerHTML = '<span class="who">' + (who === "me" ? "나" : "말벗") + "</span>";
-  d.appendChild(document.createTextNode(text));
+  d.innerHTML = '<span class="who">' + (who === "me" ? "나" : "말벗") + '</span><span class="body"></span>';
+  d.querySelector(".body").textContent = text;
   logEl.appendChild(d);
   d.scrollIntoView({behavior:"smooth", block:"end"});
+  return d;
 }
 
 // ── 띵 ───────────────────────────────────────
@@ -229,7 +231,7 @@ function ding(){
 // ── 1. 귀 ────────────────────────────────────
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 const IS_ANDROID = /Android/i.test(navigator.userAgent);
-let rec = null, saved = "", current = "", timer = null, done = false;
+let rec = null, saved = "", current = "", timer = null, done = false, lastHeardAt = 0;
 function heardText(){ return (saved + " " + current).trim(); }
 function setTimer(sec){ clearTimeout(timer); timer = setTimeout(finishListening, sec * 1000); }
 function finishListening(){ clearTimeout(timer); done = true; try{ rec && rec.stop(); }catch(e){} }
@@ -254,6 +256,7 @@ function startRec(){
     if(IS_ANDROID){ now = e.results[e.results.length - 1][0].transcript; }   // 가장 마지막(가장 긴) 것만
     else { for(const r of e.results){ now += r[0].transcript; } }
     current = now;
+    lastHeardAt = Date.now();                 // 마지막으로 말소리가 들어온 때 (시간 재기용)
     statusEl.textContent = "… " + heardText();
     const last = e.results[e.results.length - 1];
     const ended = last.isFinal && END_SOUNDS.test(heardText().replace(/[\s.?!,]+$/,""));
@@ -277,54 +280,113 @@ function isBye(text){
   return BYE_WORDS.some(w => t === w.replace(/\s/g,""));
 }
 
-// ── 2. 머리: 중계 서버를 거쳐 AI에게 ─────────
-async function callAI(messages){
-  const r = await fetch(WORKER_URL, {method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({code: CODE, system: buildSystem(), messages, tools: TOOLS})});
-  const j = await r.json().catch(() => ({}));
+// ── 2. 머리: 중계 서버를 거쳐 AI에게 (흘려받기) ─────────
+// ★ AI가 대답을 다 쓸 때까지 기다리지 않고, 쓰는 대로 조금씩 받는다.
+let aborter = null;
+
+async function callAIStream(messages, onText){
+  aborter = new AbortController();
+  const r = await fetch(WORKER_URL, {method:"POST", headers:{"Content-Type":"application/json"}, signal: aborter.signal,
+    body: JSON.stringify({code: CODE, system: buildSystem(), messages, tools: TOOLS, stream: true})});
   if(!r.ok){
-    // 중계 서버가 알려 준 이유를 그대로 보여 준다
+    const j = await r.json().catch(() => ({}));
     const why = typeof j.error === "string" ? j.error : (j.error && j.error.message) || "";
     if(r.status === 403 && why.indexOf("사용 번호") >= 0)
       throw new Error("사용 번호가 맞지 않습니다. 가족이 보는 곳에서 번호를 다시 넣어 주세요.");
     throw new Error(why || ("AI에게 묻는 중에 문제가 생겼습니다 (" + r.status + ")"));
   }
-  return j;
+  const reader = r.body.getReader(), dec = new TextDecoder();
+  const blocks = []; let stop = null, buf = "";
+  while(true){
+    const {value, done} = await reader.read();
+    if(done) break;
+    buf += dec.decode(value, {stream:true});
+    let cut;
+    while((cut = buf.indexOf("\n\n")) >= 0){
+      const ev = buf.slice(0, cut); buf = buf.slice(cut + 2);
+      const line = ev.split("\n").find(l => l.startsWith("data:"));
+      if(!line) continue;
+      let d; try{ d = JSON.parse(line.slice(5)); }catch(e){ continue; }
+      if(d.type === "content_block_start"){
+        const b = Object.assign({}, d.content_block);
+        if(b.type === "text") b.text = "";
+        if(b.type === "tool_use"){ b.input = {}; b._json = ""; }
+        blocks[d.index] = b;
+      } else if(d.type === "content_block_delta"){
+        const b = blocks[d.index]; if(!b) continue;
+        if(d.delta.type === "text_delta"){ b.text += d.delta.text; onText(d.delta.text); }
+        if(d.delta.type === "input_json_delta"){ b._json += d.delta.partial_json; }
+      } else if(d.type === "content_block_stop"){
+        const b = blocks[d.index];
+        if(b && b.type === "tool_use"){ try{ b.input = b._json ? JSON.parse(b._json) : {}; }catch(e){ b.input = {}; } delete b._json; }
+      } else if(d.type === "message_delta"){
+        stop = d.delta.stop_reason || stop;
+      } else if(d.type === "error"){
+        throw new Error("AI가 대답하다 멈췄습니다: " + ((d.error && d.error.message) || ""));
+      }
+    }
+  }
+  return {blocks: blocks.filter(Boolean), stop};
 }
 
+let turnId = 0;
 async function think(text){
+  const myTurn = ++turnId;
   addMsg("me", text);
   byeAfterReply = isBye(text);
   setState("think","생각하고 있습니다…");
   history.push({role:"user", content:text});
   let msgs = history.slice(-KEEP);
   if(msgs[0].role !== "user") msgs = msgs.slice(1);
+
+  const sentAt = Date.now();
+  const waited = lastHeardAt ? (sentAt - lastHeardAt) / 1000 : 0;
+  const aiDiv = addMsg("ai", "");            // 대답이 쓰이는 대로 채울 자리
+  const aiText = aiDiv.querySelector(".body");
+  let answer = "";
+  speechBegin(() => {                        // 첫 소리가 날 때 걸린 시간을 적음
+    const t = document.createElement("div");
+    t.className = "time";
+    t.textContent = `기다림 ${waited.toFixed(1)}초 · 첫 대답까지 ${((Date.now() - sentAt) / 1000).toFixed(1)}초`;
+    aiDiv.appendChild(t);
+  });
+
   try{
-    let answer = "";
     for(let i = 0; i < 5; i++){
-      const data = await callAI(msgs);
-      const blocks = data.content || [];
-      if(data.stop_reason !== "tool_use"){
-        answer = blocks.filter(b => b.type === "text").map(b => b.text).join("").trim();
-        break;
-      }
-      msgs = msgs.concat([{role:"assistant", content: blocks}]);
-      const results = blocks.filter(b => b.type === "tool_use")
+      const res = await callAIStream(msgs, t => {
+        answer += t; aiText.textContent = answer;
+        aiDiv.scrollIntoView({block:"end"});
+        speechFeed(t);
+      });
+      if(res.stop !== "tool_use") break;
+      // 연장을 쓰겠다고 함 → 대신 써 주고 결과를 돌려주며 이어서 묻는다
+      const clean = res.blocks
+        .filter(b => b.type === "tool_use" || (b.type === "text" && b.text.trim()))
+        .map(b => b.type === "text" ? {type:"text", text:b.text} : {type:"tool_use", id:b.id, name:b.name, input:b.input});
+      msgs = msgs.concat([{role:"assistant", content: clean}]);
+      const results = clean.filter(b => b.type === "tool_use")
         .map(b => ({type:"tool_result", tool_use_id: b.id, content: runTool(b.name, b.input || {})}));
       msgs = msgs.concat([{role:"user", content: results}]);
+      if(answer && !/\s$/.test(answer)){ answer += " "; speechFeed(" "); }
     }
-    if(!answer) answer = "죄송합니다. 다시 한번 말씀해 주세요.";
-    history.push({role:"assistant", content:answer});
-    addMsg("ai", answer);
-    speak(answer);
+    if(myTurn !== turnId) return;           // 그사이 끼어들었으면 여기서 멈춤
+    if(!answer.trim()){ answer = "죄송합니다. 다시 한번 말씀해 주세요."; aiText.textContent = answer; speechFeed(answer); }
+    history.push({role:"assistant", content:answer.trim()});
+    speechEnd();
   }catch(e){
-    history.pop();
+    if(e.name === "AbortError"){             // 어르신이 끼어들어 멈춘 경우
+      if(answer.trim()) history.push({role:"assistant", content:answer.trim()});
+      else history.pop();
+      return;
+    }
+    if(answer.trim()) history.push({role:"assistant", content:answer.trim()}); else history.pop();
+    speechOn = false;
     convo = false;
     setState("idle", navigator.onLine === false ? "인터넷이 끊겨 있습니다." : e.message);
   }
 }
 
-// ── 3. 입 ────────────────────────────────────
+// ── 3. 입: 받은 글을 문장 단위로 바로 읽기 ─────
 let koVoice = null;
 function pickVoice(){
   const vs = speechSynthesis.getVoices().filter(v => v.lang.replace("_","-").startsWith("ko"));
@@ -347,16 +409,44 @@ function splitForSpeech(text){
   }
   return out;
 }
-let speakQueue = [], currentUtter = null;
-function speak(text){
+
+let speakQueue = [], currentUtter = null, speakBuf = "", streamDone = true,
+    speaking = false, speechOn = false, onFirstSound = null, turnFinished = true;
+
+function speechBegin(firstCb){
   speechSynthesis.cancel();
-  speakQueue = splitForSpeech(text);
-  setState("speak","말하는 중입니다. 끊고 말씀하시려면 단추를 누르세요.");
-  speakNext();
+  speakQueue = []; speakBuf = ""; streamDone = false; speaking = false;
+  speechOn = true; onFirstSound = firstCb; turnFinished = false;
+}
+function speechFeed(t){
+  if(!speechOn) return;
+  speakBuf += t;
+  let m;
+  while((m = speakBuf.match(/^([\s\S]*?[.?!。])(\s+)/))){   // 마침표 뒤에 빈칸이 오면 한 문장 끝
+    enqueueSpeech(m[1]);
+    speakBuf = speakBuf.slice(m[0].length);
+  }
+}
+function enqueueSpeech(sentence){
+  splitForSpeech(sentence).forEach(p => speakQueue.push(p));
+  if(!speaking) speakNext();
+}
+function speechEnd(){
+  streamDone = true;
+  if(speakBuf.trim()) enqueueSpeech(speakBuf);
+  speakBuf = "";
+  if(!speaking && !speakQueue.length) finishTurn();
 }
 function speakNext(){
-  if(state !== "speak") return;
-  if(!speakQueue.length){ afterSpeaking(); return; }
+  if(!speechOn) return;
+  if(!speakQueue.length){
+    speaking = false;
+    if(streamDone) finishTurn();
+    return;
+  }
+  speaking = true;
+  if(state !== "speak") setState("speak","말하는 중입니다. 끊고 말씀하시려면 단추를 누르세요.");
+  if(onFirstSound){ onFirstSound(); onFirstSound = null; }
   currentUtter = new SpeechSynthesisUtterance(speakQueue.shift());
   currentUtter.lang = "ko-KR";
   if(koVoice) currentUtter.voice = koVoice;
@@ -364,6 +454,12 @@ function speakNext(){
   currentUtter.onend = speakNext;
   currentUtter.onerror = speakNext;
   speechSynthesis.speak(currentUtter);
+}
+function finishTurn(){
+  if(turnFinished) return;
+  turnFinished = true;
+  speechOn = false;
+  afterSpeaking();
 }
 function afterSpeaking(){
   if(byeAfterReply){ byeAfterReply = false; convo = false; }
@@ -374,13 +470,20 @@ function afterSpeaking(){
     setState("idle","대화를 마쳤습니다. 다시 하시려면 단추를 누르세요.");
   }
 }
-function stopSpeaking(){ speakQueue = []; state = "stopping"; speechSynthesis.cancel(); }
+function stopSpeaking(){
+  speechOn = false; turnFinished = true;
+  speakQueue = []; speakBuf = "";
+  state = "stopping";
+  turnId++;                                  // 진행 중이던 대답은 버림
+  try{ aborter && aborter.abort(); }catch(e){}
+  speechSynthesis.cancel();
+}
 
 // ── 단추들 ───────────────────────────────────
 btn.onclick = () => {
   if(state === "idle"){ convo = true; listen(); }
   else if(state === "listen") finishListening();
-  else if(state === "speak"){ stopSpeaking(); listen(); }
+  else if(state === "speak" || state === "think"){ stopSpeaking(); listen(); }   // 말하는 중이나 생각 중에 끼어들기
 };
 endBtn.onclick = () => {
   convo = false; stopSpeaking();
