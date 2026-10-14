@@ -138,7 +138,9 @@ $("elderSave").onclick = () => { store.set("mb_elder", $("elderBox").value.trim(
 
 // ── 지시문 (지시문.txt를 읽어 옴) ─────────────
 let PRINCIPLES = "너는 어르신의 말벗이 되어 드리는 AI 도우미다.";
-fetch("지시문.txt?" + Date.now()).then(r => r.ok ? r.text() : "").then(t => { if(t.trim()) PRINCIPLES = t.trim(); }).catch(()=>{});
+// ★ 지시문이 다 온 뒤에 AI에게 묻도록, 불러오기를 약속(promise)으로 붙잡아 둔다
+const principlesReady = fetch("지시문.txt?" + Date.now()).then(r => r.ok ? r.text() : "")
+  .then(t => { if(t.trim()) PRINCIPLES = t.trim(); }).catch(()=>{});
 
 const TOOL_RULES = `[연장 쓰는 법]
 - 어르신께서 직접 말씀하신 것 가운데 오래 기억해 둘 만한 것(호칭, 고향, 가족과 손주 이름, 섬기는 교회와 직분, 좋아하시는 말씀과 찬송, 조심하실 건강 사항)은 '기억하기'로 적어 둔다. 그날의 기분이나 한때의 일은 적지 않는다. 이미 기억하고 있는 것은 다시 적지 않는다.
@@ -196,9 +198,23 @@ function runTool(name, args){
   return "그런 연장은 없습니다.";
 }
 
+// ── 대화하는 동안 화면이 꺼지지 않게 ──────────────
+let wakeLock = null;
+async function keepAwake(){
+  try{
+    if(!wakeLock && "wakeLock" in navigator){
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener("release", () => { wakeLock = null; });
+    }
+  }catch(e){}
+}
+function letSleep(){ try{ wakeLock && wakeLock.release(); }catch(e){} wakeLock = null; }
+document.addEventListener("visibilitychange", () => { if(convo && document.visibilityState === "visible") keepAwake(); });
+
 // ── 화면 상태 ─────────────────────────────────
 function setState(s, msg){
   state = s;
+  if(convo) keepAwake(); else letSleep();
   btn.className = s === "idle" ? "" : s;
   btn.textContent = {idle:"대화 시작", listen:"다 했어요", think:"생각 중", speak:"말 끊기"}[s] || "…";
   statusEl.textContent = msg;
@@ -335,6 +351,7 @@ async function think(text){
   addMsg("me", text);
   byeAfterReply = isBye(text);
   setState("think","생각하고 있습니다…");
+  await principlesReady;                     // 지시문이 아직 안 왔으면 기다림
   history.push({role:"user", content:text});
   let msgs = history.slice(-KEEP);
   if(msgs[0].role !== "user") msgs = msgs.slice(1);
