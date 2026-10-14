@@ -282,8 +282,13 @@ async function callAI(messages){
   const r = await fetch(WORKER_URL, {method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify({code: CODE, system: buildSystem(), messages, tools: TOOLS})});
   const j = await r.json().catch(() => ({}));
-  if(r.status === 403) throw new Error("사용 번호가 맞지 않습니다. 가족이 보는 곳에서 번호를 다시 넣어 주세요.");
-  if(!r.ok) throw new Error("AI에게 묻는 중에 문제가 생겼습니다.");
+  if(!r.ok){
+    // 중계 서버가 알려 준 이유를 그대로 보여 준다
+    const why = typeof j.error === "string" ? j.error : (j.error && j.error.message) || "";
+    if(r.status === 403 && why.indexOf("사용 번호") >= 0)
+      throw new Error("사용 번호가 맞지 않습니다. 가족이 보는 곳에서 번호를 다시 넣어 주세요.");
+    throw new Error(why || ("AI에게 묻는 중에 문제가 생겼습니다 (" + r.status + ")"));
+  }
   return j;
 }
 
