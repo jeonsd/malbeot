@@ -118,7 +118,7 @@ function showScreens(){
   if(CODE) refreshFamilyBox();
 }
 $("codeSave").onclick = () => {
-  const c = $("codeIn").value.trim();
+  const c = $("codeIn").value.trim().split(/[:：]/).pop().trim();   // "시험:1234"로 넣어도 1234만 씀
   if(!c) return;
   CODE = c; store.set("mb_code", c); showScreens();
 };
@@ -228,6 +228,7 @@ function ding(){
 
 // ── 1. 귀 ────────────────────────────────────
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const IS_ANDROID = /Android/i.test(navigator.userAgent);
 let rec = null, saved = "", current = "", timer = null, done = false;
 function heardText(){ return (saved + " " + current).trim(); }
 function setTimer(sec){ clearTimeout(timer); timer = setTimeout(finishListening, sec * 1000); }
@@ -244,10 +245,14 @@ function listen(){
 function startRec(){
   if(state !== "listen" || done) return;
   rec = new SR();
-  rec.lang = "ko-KR"; rec.interimResults = true; rec.continuous = true;
+  rec.lang = "ko-KR"; rec.interimResults = true;
+  // ★ 안드로이드는 이어 듣기(continuous)를 하면 같은 말을 겹쳐서 넘겨준다.
+  //   그래서 안드로이드에서는 한 마디씩 끊어 듣고, 끝날 때마다 다시 켜서 이어 붙인다.
+  rec.continuous = !IS_ANDROID;
   rec.onresult = e => {
     let now = "";
-    for(const r of e.results){ now += r[0].transcript; }
+    if(IS_ANDROID){ now = e.results[e.results.length - 1][0].transcript; }   // 가장 마지막(가장 긴) 것만
+    else { for(const r of e.results){ now += r[0].transcript; } }
     current = now;
     statusEl.textContent = "… " + heardText();
     const last = e.results[e.results.length - 1];
