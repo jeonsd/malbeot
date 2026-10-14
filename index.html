@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>말벗</title>
+<style>
+:root{--ink:#1b2a41;--soft:#5b6b82;--bg:#eef3f8;--me:#ffffff;--ai:#dfeee6;
+      --idle:#2f5d9b;--listen:#c8372d;--think:#c98a12;--speak:#2e7d4f}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+     font-family:"Malgun Gothic","Apple SD Gothic Neo",system-ui,sans-serif;font-size:22px;line-height:1.6}
+main{max-width:640px;margin:0 auto;padding:18px 18px 270px}
+h1{font-size:26px;margin:0 0 4px}
+.help{color:var(--soft);font-size:18px;margin:0 0 18px}
+.msg{padding:14px 18px;border-radius:14px;margin:0 0 14px}
+.msg.me{background:var(--me);border:1px solid #cdd6e2}
+.msg.ai{background:var(--ai)}
+.who{font-size:16px;color:var(--soft);display:block}
+#dock{position:fixed;left:0;right:0;bottom:0;background:var(--bg);border-top:1px solid #cdd6e2;
+      padding:14px 18px 20px;text-align:center}
+#btn{width:150px;height:150px;border-radius:50%;border:0;color:#fff;font:inherit;font-size:24px;
+     font-weight:700;cursor:pointer;background:var(--idle)}
+#btn:focus-visible{outline:4px solid #f2b705;outline-offset:4px}
+#btn.listen{background:var(--listen)} #btn.think{background:var(--think)} #btn.speak{background:var(--speak)}
+#status{margin:8px 0 0;font-size:20px;min-height:1.6em}
+.small{margin:6px 4px 0;background:none;border:1px solid #9aa8bb;border-radius:8px;color:var(--soft);
+       font:inherit;font-size:17px;padding:4px 14px;cursor:pointer}
+#end[hidden]{display:none}
+details{background:#fff;border:1px solid #cdd6e2;border-radius:12px;padding:8px 14px;margin:0 0 18px;font-size:18px}
+summary{cursor:pointer;color:var(--soft)}
+textarea,input{width:100%;font:inherit;font-size:18px;padding:8px;border:1px solid #9aa8bb;border-radius:8px}
+textarea{min-height:140px}
+#setup{background:#fff;border:2px solid var(--idle);border-radius:14px;padding:18px;margin:0 0 18px}
+#setup[hidden],#app[hidden]{display:none}
+.big{display:block;width:100%;margin-top:10px;padding:12px;border:0;border-radius:10px;background:var(--idle);
+     color:#fff;font:inherit;font-size:22px;font-weight:700;cursor:pointer}
+</style>
+</head>
+<body>
+<script>
+// ── 카카오톡·라인·삼성인터넷 등에서 열렸으면 크롬으로 옮김 (음성 인식은 크롬에서만 잘 됨) ──
+(function(){
+  var ua = navigator.userAgent || "", url = location.href;
+  if(/KAKAOTALK/i.test(ua)){ location.href = "kakaotalk://web/openExternal?url=" + encodeURIComponent(url); return; }
+  if(/Line\//i.test(ua) && url.indexOf("openExternalBrowser=1") < 0){
+    location.href = url + (url.indexOf("?") < 0 ? "?" : "&") + "openExternalBrowser=1"; return; }
+  var android = /Android/i.test(ua);
+  var inapp = /NAVER|Instagram|FBAN|FBAV|SamsungBrowser/i.test(ua);
+  if(android && inapp){
+    try{ if(sessionStorage.getItem("mb_moved")) return; sessionStorage.setItem("mb_moved","1"); }catch(e){}
+    location.href = "intent://" + url.replace(/^https?:\/\//,"") +
+      "#Intent;scheme=https;package=com.android.chrome;S.browser_fallback_url=" + encodeURIComponent(url) + ";end";
+  }
+})();
+</script>
+<main>
+  <h1>말벗</h1>
+
+  <!-- 처음 한 번: 사용 번호 넣기 -->
+  <section id="setup" hidden>
+    <p style="margin-top:0">처음 한 번만 사용 번호를 넣어 주세요.</p>
+    <input id="codeIn" inputmode="numeric" placeholder="사용 번호">
+    <button class="big" id="codeSave">시작하기</button>
+  </section>
+
+  <section id="app" hidden>
+    <p class="help">단추를 누르고 "띵" 소리가 나면 말씀하세요. 마치실 때는 "여기까지다"라고 하세요.</p>
+    <details>
+      <summary>가족이 보는 곳 (기억과 약 기록)</summary>
+      <p>말벗이 기억하고 있는 것 — 고치거나 미리 적어 두셔도 됩니다.</p>
+      <textarea id="elderBox"></textarea>
+      <button class="small" id="elderSave">기억 저장</button>
+      <p>최근 약 기록</p>
+      <div id="medList" style="font-size:17px"></div>
+      <button class="small" id="codeReset">사용 번호 바꾸기</button>
+    </details>
+    <div id="log"></div>
+  </section>
+</main>
+<div id="dock">
+  <button id="btn">대화 시작</button>
+  <p id="status">단추를 누르세요</p>
+  <button id="end" class="small" hidden>대화 마치기</button>
+  <button id="reset" class="small">새 대화 시작</button>
+</div>
+
+<script>
+// ═════════════════════════════════════════════
+// ★ 여기만 고치세요: Cloudflare에서 만든 중계 서버 주소
+const WORKER_URL = "https://여기에-중계서버-주소.workers.dev";
+// ═════════════════════════════════════════════
+
+const WAIT_SEC   = 5;
+const SHORT_WAIT = 2;
+const END_SOUNDS = /(아니야|다|어|지|까|니|냐|노|나|예|라|네)$/;
+const FIRST_WAIT = 15;
+const GAP_MS     = 500;
+const KEEP       = 20;
+const BYE_WORDS  = ["여기까지다", "여기까지", "여기까지 하자"];
+
+const $ = id => document.getElementById(id);
+const btn = $("btn"), endBtn = $("end"), statusEl = $("status"), logEl = $("log");
+let state = "idle", convo = false, byeAfterReply = false, history = [];
+
+// ── 핸드폰 안에 저장하는 것들 ──────────────────
+const store = {
+  get(k, d){ try{ const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); }catch(e){ return d; } },
+  set(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
+};
+let CODE = store.get("mb_code", "");
+
+// ── 처음 화면: 사용 번호 ──────────────────────
+function showScreens(){
+  $("setup").hidden = !!CODE;
+  $("app").hidden = !CODE;
+  $("dock").style.display = CODE ? "" : "none";
+  if(CODE) refreshFamilyBox();
+}
+$("codeSave").onclick = () => {
+  const c = $("codeIn").value.trim();
+  if(!c) return;
+  CODE = c; store.set("mb_code", c); showScreens();
+};
+$("codeReset").onclick = () => {
+  if(!confirm("사용 번호를 다시 넣으시겠어요?")) return;
+  CODE = ""; store.set("mb_code", ""); showScreens();
+};
+
+// ── 가족이 보는 곳 ────────────────────────────
+function refreshFamilyBox(){
+  $("elderBox").value = store.get("mb_elder", "");
+  const meds = store.get("mb_meds", []).slice(-10).reverse();
+  $("medList").innerHTML = meds.length ? meds.map(m => `${m.date} ${m.time} ${m.when}${m.note ? " ("+m.note+")" : ""}`).join("<br>") : "아직 없습니다.";
+}
+$("elderSave").onclick = () => { store.set("mb_elder", $("elderBox").value.trim() + "\n"); refreshFamilyBox(); alert("저장했습니다."); };
+
+// ── 지시문 (지시문.txt를 읽어 옴) ─────────────
+let PRINCIPLES = "너는 어르신의 말벗이 되어 드리는 AI 도우미다.";
+fetch("지시문.txt?" + Date.now()).then(r => r.ok ? r.text() : "").then(t => { if(t.trim()) PRINCIPLES = t.trim(); }).catch(()=>{});
+
+const TOOL_RULES = `[연장 쓰는 법]
+- 어르신께서 직접 말씀하신 것 가운데 오래 기억해 둘 만한 것(호칭, 고향, 가족과 손주 이름, 섬기는 교회와 직분, 좋아하시는 말씀과 찬송, 조심하실 건강 사항)은 '기억하기'로 적어 둔다. 그날의 기분이나 한때의 일은 적지 않는다. 이미 기억하고 있는 것은 다시 적지 않는다.
+- 어르신께서 말씀하지 않으신 것을 짐작해서 적지 않는다.
+- 어르신께서 약을 드셨다고 하시면 '약 먹은 것 기록하기'로 적는다. 언제 드신 약인지(아침, 점심, 저녁, 자기 전) 분명하지 않으면 먼저 여쭙는다.
+- 약을 드셨는지 물으시면 반드시 '약 기록 찾아보기'로 확인한 뒤 기록대로만 답한다. 기록에 없으면 "적어 둔 기록이 없습니다"라고 말하고, 드셨는지 짐작해서 말하지 않는다.
+- 연장을 쓴 뒤에는 무엇을 했는지 짧게 말씀드린다.`;
+
+function nowText(){
+  const n = new Date(), day = "일월화수목금토"[n.getDay()];
+  return `지금은 ${n.getFullYear()}년 ${n.getMonth()+1}월 ${n.getDate()}일 ${day}요일 ${n.getHours()}시 ${n.getMinutes()}분이다.`;
+}
+function buildSystem(){
+  const elder = store.get("mb_elder", "").trim() || "(아직 기억한 것이 없다)";
+  return PRINCIPLES + "\n\n[이 어르신에 대해 기억하고 있는 것]\n" + elder + "\n\n" + TOOL_RULES + "\n\n" + nowText();
+}
+
+// ── 손: 연장들 (이제 핸드폰이 직접 실행) ──────
+const TOOLS = [
+  {name:"remember", description:"어르신에 대해 오래 기억해 둘 사실 하나를 적어 둔다. 다음 대화에서도 기억된다.",
+   input_schema:{type:"object", properties:{fact:{type:"string", description:"기억할 사실 한 문장"}}, required:["fact"]}},
+  {name:"record_medicine", description:"어르신께서 약을 드셨다고 하시면 날짜·시각과 함께 기록한다.",
+   input_schema:{type:"object", properties:{
+     when:{type:"string", enum:["아침","점심","저녁","자기 전","기타"], description:"어느 때 드시는 약인지"},
+     note:{type:"string", description:"덧붙일 말이 있으면"}}, required:["when"]}},
+  {name:"check_medicine", description:"약을 드신 기록을 찾아본다. 오늘 약을 드셨는지 물으시면 반드시 이것으로 확인한다.",
+   input_schema:{type:"object", properties:{days:{type:"integer", description:"며칠 치를 볼지. 오늘만이면 1"}}, required:[]}}
+];
+function pad(n){ return String(n).padStart(2,"0"); }
+function ymd(d){ return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`; }
+
+function runTool(name, args){
+  const n = new Date();
+  if(name === "remember"){
+    const fact = String(args.fact || "").trim();
+    if(!fact) return "적을 내용이 없습니다.";
+    store.set("mb_elder", store.get("mb_elder", "") + `- ${fact}  (${ymd(n)} 기억함)\n`);
+    refreshFamilyBox();
+    return "기억해 두었습니다: " + fact;
+  }
+  if(name === "record_medicine"){
+    const meds = store.get("mb_meds", []);
+    meds.push({date: ymd(n), time: `${pad(n.getHours())}:${pad(n.getMinutes())}`, when: args.when || "기타", note: args.note || ""});
+    store.set("mb_meds", meds.slice(-500));
+    refreshFamilyBox();
+    return `${n.getMonth()+1}월 ${n.getDate()}일 ${n.getHours()}시 ${n.getMinutes()}분에 ${args.when} 약 드신 것을 기록했습니다.`;
+  }
+  if(name === "check_medicine"){
+    const days = Math.max(1, Math.min(parseInt(args.days || 1), 14));
+    const since = ymd(new Date(n.getTime() - (days - 1) * 86400000));
+    const rows = store.get("mb_meds", []).filter(m => m.date >= since);
+    if(!rows.length) return days === 1 ? "오늘은 약 드신 기록이 없습니다." : `최근 ${days}일 동안 약 드신 기록이 없습니다.`;
+    return "약 드신 기록:\n" + rows.map(m => `${m.date} ${m.time} ${m.when}${m.note ? " ("+m.note+")" : ""}`).join("\n");
+  }
+  return "그런 연장은 없습니다.";
+}
+
+// ── 화면 상태 ─────────────────────────────────
+function setState(s, msg){
+  state = s;
+  btn.className = s === "idle" ? "" : s;
+  btn.textContent = {idle:"대화 시작", listen:"다 했어요", think:"생각 중", speak:"말 끊기"}[s] || "…";
+  statusEl.textContent = msg;
+  endBtn.hidden = !convo;
+}
+function addMsg(who, text){
+  const d = document.createElement("div");
+  d.className = "msg " + who;
+  d.innerHTML = '<span class="who">' + (who === "me" ? "나" : "말벗") + "</span>";
+  d.appendChild(document.createTextNode(text));
+  logEl.appendChild(d);
+  d.scrollIntoView({behavior:"smooth", block:"end"});
+}
+
+// ── 띵 ───────────────────────────────────────
+let audioCtx = null;
+function ding(){
+  try{
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.frequency.value = 880;
+    g.gain.setValueAtTime(0.25, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.4);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + 0.4);
+  }catch(e){}
+}
+
+// ── 1. 귀 ────────────────────────────────────
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null, saved = "", current = "", timer = null, done = false;
+function heardText(){ return (saved + " " + current).trim(); }
+function setTimer(sec){ clearTimeout(timer); timer = setTimeout(finishListening, sec * 1000); }
+function finishListening(){ clearTimeout(timer); done = true; try{ rec && rec.stop(); }catch(e){} }
+
+function listen(){
+  if(!SR){ convo = false; setState("idle","음성 인식이 안 됩니다. 크롬 브라우저로 열어 주세요."); return; }
+  saved = ""; current = ""; done = false;
+  ding();
+  setState("listen","말씀하세요.");
+  setTimeout(startRec, 300);
+  setTimer(FIRST_WAIT);
+}
+function startRec(){
+  if(state !== "listen" || done) return;
+  rec = new SR();
+  rec.lang = "ko-KR"; rec.interimResults = true; rec.continuous = true;
+  rec.onresult = e => {
+    let now = "";
+    for(const r of e.results){ now += r[0].transcript; }
+    current = now;
+    statusEl.textContent = "… " + heardText();
+    const last = e.results[e.results.length - 1];
+    const ended = last.isFinal && END_SOUNDS.test(heardText().replace(/[\s.?!,]+$/,""));
+    setTimer(ended ? SHORT_WAIT : WAIT_SEC);
+  };
+  rec.onerror = e => {
+    if(e.error === "not-allowed"){ done = true; convo = false; clearTimeout(timer); setState("idle","마이크를 허용해 주세요."); }
+  };
+  rec.onend = () => {
+    if(state !== "listen") return;
+    if(!done){ saved = heardText(); current = ""; try{ startRec(); }catch(e){} return; }
+    const text = heardText();
+    if(text){ think(text); return; }
+    convo = false;
+    setState("idle","말씀이 없으셔서 쉬고 있습니다. 다시 하시려면 단추를 누르세요.");
+  };
+  try{ rec.start(); }catch(e){}
+}
+function isBye(text){
+  const t = text.replace(/[\s.?!,]/g,"");
+  return BYE_WORDS.some(w => t === w.replace(/\s/g,""));
+}
+
+// ── 2. 머리: 중계 서버를 거쳐 AI에게 ─────────
+async function callAI(messages){
+  const r = await fetch(WORKER_URL, {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({code: CODE, system: buildSystem(), messages, tools: TOOLS})});
+  const j = await r.json().catch(() => ({}));
+  if(r.status === 403) throw new Error("사용 번호가 맞지 않습니다. 가족이 보는 곳에서 번호를 다시 넣어 주세요.");
+  if(!r.ok) throw new Error("AI에게 묻는 중에 문제가 생겼습니다.");
+  return j;
+}
+
+async function think(text){
+  addMsg("me", text);
+  byeAfterReply = isBye(text);
+  setState("think","생각하고 있습니다…");
+  history.push({role:"user", content:text});
+  let msgs = history.slice(-KEEP);
+  if(msgs[0].role !== "user") msgs = msgs.slice(1);
+  try{
+    let answer = "";
+    for(let i = 0; i < 5; i++){
+      const data = await callAI(msgs);
+      const blocks = data.content || [];
+      if(data.stop_reason !== "tool_use"){
+        answer = blocks.filter(b => b.type === "text").map(b => b.text).join("").trim();
+        break;
+      }
+      msgs = msgs.concat([{role:"assistant", content: blocks}]);
+      const results = blocks.filter(b => b.type === "tool_use")
+        .map(b => ({type:"tool_result", tool_use_id: b.id, content: runTool(b.name, b.input || {})}));
+      msgs = msgs.concat([{role:"user", content: results}]);
+    }
+    if(!answer) answer = "죄송합니다. 다시 한번 말씀해 주세요.";
+    history.push({role:"assistant", content:answer});
+    addMsg("ai", answer);
+    speak(answer);
+  }catch(e){
+    history.pop();
+    convo = false;
+    setState("idle", navigator.onLine === false ? "인터넷이 끊겨 있습니다." : e.message);
+  }
+}
+
+// ── 3. 입 ────────────────────────────────────
+let koVoice = null;
+function pickVoice(){
+  const vs = speechSynthesis.getVoices().filter(v => v.lang.replace("_","-").startsWith("ko"));
+  koVoice = vs.find(v => /Natural|Online|Google/i.test(v.name)) || vs[0] || null;
+}
+speechSynthesis.onvoiceschanged = pickVoice;
+pickVoice();
+
+function splitForSpeech(text){
+  const sentences = text.replace(/\s+/g," ").match(/[^.?!。]+[.?!。]?/g) || [text];
+  const out = [];
+  for(const s of sentences){
+    if(s.trim().length <= 80){ if(s.trim()) out.push(s.trim()); continue; }
+    let buf = "";
+    for(const piece of s.split(/(?<=,)/)){
+      if((buf + piece).length > 80 && buf){ out.push(buf.trim()); buf = ""; }
+      buf += piece;
+    }
+    if(buf.trim()) out.push(buf.trim());
+  }
+  return out;
+}
+let speakQueue = [], currentUtter = null;
+function speak(text){
+  speechSynthesis.cancel();
+  speakQueue = splitForSpeech(text);
+  setState("speak","말하는 중입니다. 끊고 말씀하시려면 단추를 누르세요.");
+  speakNext();
+}
+function speakNext(){
+  if(state !== "speak") return;
+  if(!speakQueue.length){ afterSpeaking(); return; }
+  currentUtter = new SpeechSynthesisUtterance(speakQueue.shift());
+  currentUtter.lang = "ko-KR";
+  if(koVoice) currentUtter.voice = koVoice;
+  currentUtter.rate = 0.95;
+  currentUtter.onend = speakNext;
+  currentUtter.onerror = speakNext;
+  speechSynthesis.speak(currentUtter);
+}
+function afterSpeaking(){
+  if(byeAfterReply){ byeAfterReply = false; convo = false; }
+  if(convo){
+    setState("think","…");
+    setTimeout(() => { if(convo) listen(); }, GAP_MS);
+  } else {
+    setState("idle","대화를 마쳤습니다. 다시 하시려면 단추를 누르세요.");
+  }
+}
+function stopSpeaking(){ speakQueue = []; state = "stopping"; speechSynthesis.cancel(); }
+
+// ── 단추들 ───────────────────────────────────
+btn.onclick = () => {
+  if(state === "idle"){ convo = true; listen(); }
+  else if(state === "listen") finishListening();
+  else if(state === "speak"){ stopSpeaking(); listen(); }
+};
+endBtn.onclick = () => {
+  convo = false; stopSpeaking();
+  done = true; clearTimeout(timer);
+  try{ rec && rec.stop(); }catch(e){}
+  setState("idle","대화를 마쳤습니다. 다시 하시려면 단추를 누르세요.");
+};
+$("reset").onclick = () => {
+  endBtn.onclick();
+  history = []; logEl.innerHTML = "";
+  statusEl.textContent = "새 대화를 시작합니다. 단추를 누르세요.";
+};
+
+showScreens();
+</script>
+</body>
+</html>
