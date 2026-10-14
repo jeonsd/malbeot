@@ -102,6 +102,7 @@ const WAIT_SEC   = 5;
 const SHORT_WAIT = 1.2;   // 말끝이 마치는 말이면 이만큼만 기다림 (초)
 const END_SOUNDS = /(아니야|다|어|지|까|니|냐|노|나|예|라|네)$/;
 const FIRST_WAIT = 15;
+const PRE_WAIT   = 0.7;   // ★ 말소리가 이만큼 멎으면 (기다리는 동안) 미리 AI에게 물어 둠 (초)
 const GAP_MS     = 500;
 const KEEP       = 20;
 const BYE_WORDS  = ["여기까지다", "여기까지", "여기까지 하자"];
@@ -261,6 +262,7 @@ function finishListening(){ clearTimeout(timer); done = true; try{ rec && rec.st
 function listen(){
   if(!SR){ convo = false; setState("idle","음성 인식이 안 됩니다. 크롬 브라우저로 열어 주세요."); return; }
   saved = ""; current = ""; done = false;
+  cancelPre();
   ding();
   setState("listen","말씀하세요.");
   setTimeout(startRec, 300);
@@ -283,6 +285,10 @@ function startRec(){
     const last = e.results[e.results.length - 1];
     const ended = last.isFinal && END_SOUNDS.test(heardText().replace(/[\s.?!,]+$/,""));
     setTimer(ended ? SHORT_WAIT : WAIT_SEC);
+    // ★ 말이 달라졌으면 받아 두던 것은 버리고, 말소리가 멎으면 미리 묻기 시작
+    if(pre && pre.text !== heardText()) cancelPre();
+    clearTimeout(preTimer);
+    preTimer = setTimeout(startPre, (ended ? 0 : PRE_WAIT) * 1000);
   };
   rec.onerror = e => {
     if(e.error === "not-allowed"){ done = true; convo = false; clearTimeout(timer); setState("idle","마이크를 허용해 주세요."); }
@@ -292,6 +298,7 @@ function startRec(){
     if(!done){ saved = heardText(); current = ""; try{ startRec(); }catch(e){} return; }
     const text = heardText();
     if(text){ think(text); return; }
+    cancelPre();
     convo = false;
     setState("idle","말씀이 없으셔서 쉬고 있습니다. 다시 하시려면 단추를 누르세요.");
   };
@@ -305,13 +312,11 @@ function isBye(text){
 // ── 2. 머리: 중계 서버를 거쳐 AI에게 (흘려받기) ─────────
 // ★ AI가 대답을 다 쓸 때까지 기다리지 않고, 쓰는 대로 조금씩 받는다.
 let aborter = null;
-let diag = {};   // ★ 시간 재기(진단용): 응답 시작·첫 조각·첫 글자·조각 수
 
-async function callAIStream(messages, onText){
-  aborter = new AbortController();
+async function callAIStream(messages, onText, ctrl){
+  aborter = ctrl || new AbortController();
   const r = await fetch(WORKER_URL, {method:"POST", headers:{"Content-Type":"application/json"}, signal: aborter.signal,
     body: JSON.stringify({code: CODE, system: buildSystem(), messages, tools: TOOLS, stream: true})});
-  if(!diag.head) diag.head = Date.now();
   if(!r.ok){
     const j = await r.json().catch(() => ({}));
     const why = typeof j.error === "string" ? j.error : (j.error && j.error.message) || "";
@@ -324,8 +329,6 @@ async function callAIStream(messages, onText){
   while(true){
     const {value, done} = await reader.read();
     if(done) break;
-    diag.chunks = (diag.chunks || 0) + 1;
-    if(!diag.chunk1) diag.chunk1 = Date.now();
     buf += dec.decode(value, {stream:true});
     let cut;
     while((cut = buf.indexOf("\n\n")) >= 0){
@@ -340,7 +343,7 @@ async function callAIStream(messages, onText){
         blocks[d.index] = b;
       } else if(d.type === "content_block_delta"){
         const b = blocks[d.index]; if(!b) continue;
-        if(d.delta.type === "text_delta"){ if(!diag.text1) diag.text1 = Date.now(); b.text += d.delta.text; onText(d.delta.text); }
+        if(d.delta.type === "text_delta"){ b.text += d.delta.text; onText(d.delta.text); }
         if(d.delta.type === "input_json_delta"){ b._json += d.delta.partial_json; }
       } else if(d.type === "content_block_stop"){
         const b = blocks[d.index];
@@ -355,6 +358,42 @@ async function callAIStream(messages, onText){
   return {blocks: blocks.filter(Boolean), stop};
 }
 
+// ── ★ 미리 생각해 두기 ─────────────────────────
+// 어르신 말소리가 잠깐 멎으면, 말이 다 끝났다고 정하기 전에 미리 AI에게 물어 둔다.
+// 대답은 받아 두기만 하고 소리는 내지 않는다. 말이 끝난 것으로 정해지면 받아 둔 것을 바로 쓰고,
+// 그사이 어르신이 말씀을 이으시면 받아 둔 것은 버리고 나중에 다시 묻는다.
+// (연장은 미리 쓰지 않는다. 약 기록이 두 번 적히는 일이 없도록, 연장은 진짜 차례에서만 쓴다.)
+let pre = null, preTimer = null;
+function trimMsgs(list){
+  let m = list.slice(-KEEP);
+  if(m.length && m[0].role !== "user") m = m.slice(1);
+  return m;
+}
+function cancelPre(){
+  clearTimeout(preTimer);
+  if(pre){ try{ pre.ctrl.abort(); }catch(e){} pre = null; }
+}
+async function startPre(){
+  if(state !== "listen" || done) return;
+  const text = heardText();
+  if(!text || (pre && pre.text === text)) return;
+  cancelPre();
+  const p = {text, answer:"", onText:null, ctrl:new AbortController()};
+  pre = p;
+  await principlesReady;
+  if(pre !== p) return;
+  const msgs = trimMsgs(history.concat([{role:"user", content:text}]));
+  p.promise = callAIStream(msgs, t => { p.answer += t; if(p.onText) p.onText(t); }, p.ctrl)
+    .catch(e => { p.err = e; return null; });
+}
+function takePre(text){                      // 말이 끝났을 때: 받아 둔 것이 이 말에 대한 것이면 넘겨줌
+  clearTimeout(preTimer);
+  const p = pre; pre = null;
+  if(p && p.text === text && p.promise) return p;
+  if(p){ try{ p.ctrl.abort(); }catch(e){} }
+  return null;
+}
+
 let turnId = 0;
 async function think(text){
   const myTurn = ++turnId;
@@ -363,33 +402,45 @@ async function think(text){
   setState("think","생각하고 있습니다…");
   await principlesReady;                     // 지시문이 아직 안 왔으면 기다림
   history.push({role:"user", content:text});
-  let msgs = history.slice(-KEEP);
-  if(msgs[0].role !== "user") msgs = msgs.slice(1);
+  let msgs = trimMsgs(history);
+  const p = takePre(text);
 
   const sentAt = Date.now();
   const waited = lastHeardAt ? (sentAt - lastHeardAt) / 1000 : 0;
   const aiDiv = addMsg("ai", "");            // 대답이 쓰이는 대로 채울 자리
   const aiText = aiDiv.querySelector(".body");
   let answer = "";
-  diag = {};
-  const timeEl = document.createElement("div");
-  timeEl.className = "time";
-  aiDiv.appendChild(timeEl);
-  const sec = v => v ? ((v - sentAt) / 1000).toFixed(1) + "초" : "-";
-  const showDiag = () => {                  // ★ 어디서 시간이 드는지 나누어 보여 줌
-    timeEl.textContent = `기다림 ${waited.toFixed(1)}초 · 첫 대답까지 ${sec(diag.sound1)}`
-      + ` [응답 시작 ${sec(diag.head)} · 첫 조각 ${sec(diag.chunk1)} · 첫 글자 ${sec(diag.text1)}`
-      + ` · 다 받음 ${sec(diag.end)} · 조각 ${diag.chunks || 0}개]`;
-  };
-  speechBegin(() => { diag.sound1 = Date.now(); showDiag(); });
+  const heardEnd = lastHeardAt || sentAt;
+  speechBegin(() => {                        // ★ 어르신이 느끼시는 시간: 말소리가 멎은 때부터 첫 소리까지
+    const t = document.createElement("div");
+    t.className = "time";
+    t.textContent = `말 끝나고 첫 소리까지 ${((Date.now() - heardEnd) / 1000).toFixed(1)}초`
+      + ` · 기다림 ${waited.toFixed(1)}초` + (p ? " · 미리 생각함" : "");
+    aiDiv.appendChild(t);
+  });
 
   try{
+    const onText = t => {
+      answer += t; aiText.textContent = answer;
+      aiDiv.scrollIntoView({block:"end"});
+      speechFeed(t);
+    };
     for(let i = 0; i < 5; i++){
-      const res = await callAIStream(msgs, t => {
-        answer += t; aiText.textContent = answer;
-        aiDiv.scrollIntoView({block:"end"});
-        speechFeed(t);
-      });
+      let res = null;
+      if(i === 0 && p){                       // ★ 미리 받아 둔 대답을 이어받음
+        aborter = p.ctrl;
+        if(p.answer) onText(p.answer);        // 이미 받은 만큼 먼저 읽고
+        p.onText = onText;                    // 나머지는 오는 대로
+        res = await p.promise;
+        p.onText = null;
+        if(!res){
+          if(p.err && p.err.name !== "AbortError") throw p.err;
+          if(answer) throw new Error("AI에게 묻는 중에 문제가 생겼습니다.");
+          res = await callAIStream(msgs, onText);   // 받아 둔 것이 없으면 새로 묻기
+        }
+      } else {
+        res = await callAIStream(msgs, onText);
+      }
       if(res.stop !== "tool_use") break;
       // 연장을 쓰겠다고 함 → 대신 써 주고 결과를 돌려주며 이어서 묻는다
       const clean = res.blocks
@@ -401,7 +452,6 @@ async function think(text){
       msgs = msgs.concat([{role:"user", content: results}]);
       if(answer && !/\s$/.test(answer)){ answer += " "; speechFeed(" "); }
     }
-    diag.end = Date.now(); showDiag();
     if(myTurn !== turnId) return;           // 그사이 끼어들었으면 여기서 멈춤
     if(!answer.trim()){ answer = "죄송합니다. 다시 한번 말씀해 주세요."; aiText.textContent = answer; speechFeed(answer); }
     history.push({role:"assistant", content:answer.trim()});
@@ -519,7 +569,7 @@ btn.onclick = () => {
   else if(state === "speak" || state === "think"){ stopSpeaking(); listen(); }   // 말하는 중이나 생각 중에 끼어들기
 };
 endBtn.onclick = () => {
-  convo = false; stopSpeaking();
+  convo = false; cancelPre(); stopSpeaking();
   done = true; clearTimeout(timer);
   try{ rec && rec.stop(); }catch(e){}
   setState("idle","대화를 마쳤습니다. 다시 하시려면 단추를 누르세요.");
