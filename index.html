@@ -154,7 +154,12 @@ const TOOL_RULES = `[연장 쓰는 법]
 - 어르신께서 말씀하지 않으신 것을 짐작해서 적지 않는다.
 - 어르신께서 약을 드셨다고 하시면 '약 먹은 것 기록하기'로 적는다. 언제 드신 약인지(아침, 점심, 저녁, 자기 전) 분명하지 않으면 먼저 여쭙는다.
 - 약을 드셨는지 물으시면 반드시 '약 기록 찾아보기'로 확인한 뒤 기록대로만 답한다. 기록에 없으면 "적어 둔 기록이 없습니다"라고 말하고, 드셨는지 짐작해서 말하지 않는다.
-- 연장을 쓴 뒤에는 무엇을 했는지 짧게 말씀드린다.`;
+- 연장을 쓴 뒤에는 무엇을 했는지 짧게 말씀드린다.
+- 기초연금, 복지 제도, 병원이나 관공서 일, 버스 시간, 날씨, 요즘 소식처럼 그때그때 바뀌는 생활정보를 물으시면 '웹 검색'으로 찾아본 뒤 답한다. 평소 이야기, 옛이야기, 신앙 이야기에는 검색하지 않는다.
+- 검색하기 전에는 먼저 "잠깐만요, 찾아볼게요."라고 한 문장만 말한다.
+- 찾은 것은 어르신이 알아들으시기 쉽게 핵심만 두세 문장으로 말한다. 인터넷 주소, 영어, 출처 이름, 긴 숫자 목록은 읽지 않는다.
+- 버스 시간처럼 사는 곳에 따라 다른 것은, 기억하고 있는 것에 사시는 곳이 없으면 먼저 여쭙는다.
+- 찾아도 분명하지 않거나 어르신 형편에 따라 달라지는 것(받을 수 있는 금액, 자격 같은 것)은 짐작해서 단정하지 말고, 주민센터나 해당 기관에 전화로 확인해 보시라고 권한다.`;
 
 function nowText(){
   const n = new Date(), day = "일월화수목금토"[n.getDay()];
@@ -174,7 +179,10 @@ const TOOLS = [
      when:{type:"string", enum:["아침","점심","저녁","자기 전","기타"], description:"어느 때 드시는 약인지"},
      note:{type:"string", description:"덧붙일 말이 있으면"}}, required:["when"]}},
   {name:"check_medicine", description:"약을 드신 기록을 찾아본다. 오늘 약을 드셨는지 물으시면 반드시 이것으로 확인한다.",
-   input_schema:{type:"object", properties:{days:{type:"integer", description:"며칠 치를 볼지. 오늘만이면 1"}}, required:[]}}
+   input_schema:{type:"object", properties:{days:{type:"integer", description:"며칠 치를 볼지. 오늘만이면 1"}}, required:[]}},
+  // ★ 웹 검색: 핸드폰이 아니라 Anthropic 서버가 대신 찾아 준다. 한 번 대답에 최대 2번까지만.
+  {type:"web_search_20250305", name:"web_search", max_uses:2,
+   user_location:{type:"approximate", country:"KR", timezone:"Asia/Seoul"}}
 ];
 function pad(n){ return String(n).padStart(2,"0"); }
 function ymd(d){ return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`; }
@@ -348,6 +356,7 @@ async function callAIStream(messages, onText, ctrl){
       } else if(d.type === "content_block_stop"){
         const b = blocks[d.index];
         if(b && b.type === "tool_use"){ try{ b.input = b._json ? JSON.parse(b._json) : {}; }catch(e){ b.input = {}; } delete b._json; }
+        if(b && b.type === "text" && b.text && !/\s$/.test(b.text)) onText(" ");   // ★ 문장을 끝맺어 바로 읽게 함
       } else if(d.type === "message_delta"){
         stop = d.delta.stop_reason || stop;
       } else if(d.type === "error"){
